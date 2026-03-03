@@ -3,13 +3,57 @@ High School Management System API
 
 A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
+This version uses persistent SQLite database storage.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from sqlalchemy import create_engine, Column, String, Integer, ForeignKey, Table
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy import delete
+
+# Database configuration
+db_path = Path(__file__).parent.parent / "activities.db"
+DATABASE_URL = f"sqlite:///{db_path}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Database Models
+class Activity(Base):
+    __tablename__ = "activities"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    description = Column(String)
+    schedule = Column(String)
+    max_participants = Column(Integer)
+    
+    enrollments = relationship("Enrollment", back_populates="activity", cascade="all, delete-orphan")
+
+class Enrollment(Base):
+    __tablename__ = "enrollments"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, index=True)
+    activity_id = Column(Integer, ForeignKey("activities.id"))
+    
+    activity = relationship("Activity", back_populates="enrollments")
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -19,8 +63,8 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
+# Sample data for initial database population
+default_activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -77,56 +121,105 @@ activities = {
     }
 }
 
+@app.on_event("startup")
+def init_db():
+    """Initialize database with sample data on startup"""
+    db = SessionLocal()
+    try:
+        # Check if activities already exist
+        if db.query(Activity).first() is None:
+            # Populate with sample data
+            for name, details in default_activities.items():
+                activity = Activity(
+                    name=name,
+                    description=details["description"],
+                    schedule=details["schedule"],
+                    max_participants=details["max_participants"]
+                )
+                db.add(activity)
+                
+                # Add existing participants
+                db.flush()
+                for email in details["participants"]:
+                    enrollment = Enrollment(email=email, activity_id=activity.id)
+                    db.add(enrollment)
+            db.commit()
+    finally:
+        db.close()
 
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
 
-
 @app.get("/activities")
-def get_activities():
-    return activities
+def get_activities(db: Session = Depends(get_db)):
+    """Get all activities with participant counts"""
+    activities = db.query(Activity).all()
+    result = {}
+    for activity in activities:
+        result[activity.name] = {
+            "description": activity.description,
+            "schedule": activity.schedule,
+            "max_participants": activity.max_participants,
+            "participants": [e.email for e in activity.enrollments]
+        }
+    return result
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, db: Session = Depends(get_db)):
     """Sign up a student for an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = db.query(Activity).filter(Activity.name == activity_name).first()
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
-
     # Validate student is not already signed up
-    if email in activity["participants"]:
+    existing = db.query(Enrollment).filter(
+        Enrollment.activity_id == activity.id,
+        Enrollment.email == email
+    ).first()
+    if existing:
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
         )
 
+    # Check capacity
+    current_count = db.query(Enrollment).filter(Enrollment.activity_id == activity.id).count()
+    if current_count >= activity.max_participants:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Activity is full (max {activity.max_participants} participants)"
+        )
+
     # Add student
-    activity["participants"].append(email)
+    enrollment = Enrollment(email=email, activity_id=activity.id)
+    db.add(enrollment)
+    db.commit()
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, db: Session = Depends(get_db)):
     """Unregister a student from an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = db.query(Activity).filter(Activity.name == activity_name).first()
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is signed up
-    if email not in activity["participants"]:
+    # Find and validate enrollment
+    enrollment = db.query(Enrollment).filter(
+        Enrollment.activity_id == activity.id,
+        Enrollment.email == email
+    ).first()
+    if not enrollment:
         raise HTTPException(
             status_code=400,
             detail="Student is not signed up for this activity"
         )
 
-    # Remove student
-    activity["participants"].remove(email)
+    # Remove enrollment
+    db.delete(enrollment)
+    db.commit()
     return {"message": f"Unregistered {email} from {activity_name}"}
